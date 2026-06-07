@@ -38,6 +38,7 @@ for p in (str(RGB_ROOT), str(BAI_ROOT)):
 
 from autumn_env import AutumnBenchEnvWrapper          # noqa: E402
 from rgb_agent.agent.opencode_agent import OpenCodeAgent  # noqa: E402
+from rgb_agent.agent.text_tool_agent import TextToolAgent  # noqa: E402
 
 # Load provider API keys into os.environ so the OpenCode container (which is
 # passed -e OPENROUTER_API_KEY/etc. from os.environ) can authenticate. The
@@ -210,6 +211,9 @@ def main() -> None:
     ap.add_argument("--interval", type=int, default=6, help="actions per analyzer batch plan")
     ap.add_argument("--analyzer-retries", type=int, default=8,
                     help="analyzer reissues per batch (absorbs gemini MALFORMED_FUNCTION_CALL churn)")
+    ap.add_argument("--analyzer-mode", default="opencode", choices=["opencode", "texttool"],
+                    help="opencode = native-function-calling OpenCode sandbox (default); "
+                         "texttool = ReAct text-protocol analyzer (no native tools, no MALFORMED)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None, help="output dir (default: RGB-Agent/evaluation_results_autumn/<ts>)")
     args = ap.parse_args()
@@ -226,11 +230,13 @@ def main() -> None:
         seed=args.seed, render_mode="text",
         logging_path=str(out_dir / "autumn_inner"),
     )
-    agent = OpenCodeAgent(
+    AgentCls = TextToolAgent if args.analyzer_mode == "texttool" else OpenCodeAgent
+    log.info("analyzer mode: %s (%s)", args.analyzer_mode, AgentCls.__name__)
+    agent = AgentCls(
         model=args.model,
         plan_size=args.interval,
         resume_session=True,
-        restrict_tools=False,   # rootless sandbox: rely on OS container isolation
+        restrict_tools=False,   # opencode only: rootless sandbox relies on OS container isolation
         initial_prompt=INITIAL_PROMPT,
         resume_prompt=RESUME_PROMPT,
         actions_addendum=ACTIONS_ADDENDUM,
