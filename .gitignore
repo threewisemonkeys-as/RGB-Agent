@@ -10,6 +10,8 @@ env/
 .env.*
 
 evaluation_results/
+evaluation_results_autumn/
+evaluation_results_minihack/
 
 memory/
 
