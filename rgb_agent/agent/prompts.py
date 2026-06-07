@@ -41,7 +41,12 @@ ACTIONS_ADDENDUM = """
 [ACTIONS]
 {{"plan": [{{"action": "ACTION1"}}, {{"action": "ACTION6", "x": 3, "y": 7}}, ...], "reasoning": "why these steps"}}
 
-Available actions: ACTION1-4 (moves), ACTION6 (click at x,y), ACTION5 (no-op), RESET.
+Action vocabulary: ACTION1-4 (directional moves), ACTION6 (click at x,y), ACTION5 (no-op), RESET.
+CRITICAL: only some of these work in the current game. The log marks the real set under
+"**Available actions THIS GAME**" — you MUST plan ONLY actions from that list. Any action
+not in that set is silently ignored and produces NO state change (e.g. clicking ACTION6 in a
+move-only game wastes the turn). If your clicks/moves repeatedly cause no change, switch to a
+DIFFERENT action type from the available set before trying more of the same.
 Each action MUST be a JSON object: {{"action": "ACTION6", "x": <row>, "y": <col>}} for clicks, {{"action": "ACTION1"}} for moves. Never use string shorthand like "ACTION6(x,y)".
 Plan 1–{plan_size} actions. IMPORTANT: shorter plans (3-5 steps) are strongly preferred
 because the agent can re-evaluate sooner. Only use more than 5 if you have very high

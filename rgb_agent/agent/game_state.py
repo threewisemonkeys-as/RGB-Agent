@@ -144,6 +144,36 @@ class GameState:
             lines.append(text)
         return "\n".join(lines) + "\n"
 
+    # --- Available actions (surface the game's real action set) ---
+
+    def format_available_actions(self) -> str:
+        """Render the game's real per-frame action set so the analyzer doesn't
+        guess. The ARC frame reports `available_actions` as a list of ints
+        (1->ACTION1 ... 6->ACTION6, 0->RESET); actions NOT listed do nothing."""
+        obs = self.last_observation or {}
+        avail = obs.get("available_actions")
+        if not avail:
+            return ""
+        names = []
+        for a in avail:
+            try:
+                names.append(GameAction.from_id(int(a)).name)
+            except Exception:
+                names.append(str(a))
+        descs = {
+            "ACTION1": "move up", "ACTION2": "move down",
+            "ACTION3": "move left", "ACTION4": "move right",
+            "ACTION5": "no-op", "ACTION6": "click at x,y", "RESET": "restart",
+        }
+        listed = ", ".join(names)
+        detail = "; ".join(f"{n} = {descs[n]}" for n in names if n in descs)
+        return (
+            f"**Available actions THIS GAME (the game ONLY responds to these — any "
+            f"other action is silently ignored and produces NO state change):**\n"
+            f"{listed}\n"
+            f"({detail})\n"
+        )
+
     # --- Build observation context (for prompt log) ---
 
     def build_observation_context(
@@ -151,6 +181,7 @@ class GameState:
     ) -> str:
         history = self.format_step_history()
         tried = self.format_state_action_context(grid_raw)
+        avail = self.format_available_actions()
 
         hint_block = ""
         if self._external_hint:
@@ -163,6 +194,7 @@ class GameState:
             f"{hint_block}"
             f"{history}"
             f"{tried}"
+            f"{avail}"
             f"**Current State:**\n"
             f"Score: {score}\n"
             f"Step: {self.action_counter}\n\n"

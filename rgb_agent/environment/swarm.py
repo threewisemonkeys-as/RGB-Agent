@@ -152,8 +152,16 @@ def main() -> None:
                         help="Actions per analyzer batch plan")
     parser.add_argument("--model", "-m", dest="analyzer_model", default="claude-opus-4-6",
                         help="Analyzer model")
-    parser.add_argument("--retries", dest="analyzer_retries", type=int, default=5,
-                        help="Max analyzer retry attempts")
+    parser.add_argument("--retries", dest="analyzer_retries", type=int, default=8,
+                        help="Max analyzer retry attempts (with capped backoff between attempts)")
+    parser.add_argument("--no-resume", dest="no_resume", action="store_true",
+                        help="Fresh opencode session per analyzer call instead of resuming. "
+                             "Needed for models that return an empty assistant message on "
+                             "--continue (e.g. gemini-2.5-flash via openrouter).")
+    parser.add_argument("--no-tool-restrictions", dest="no_tool_restrictions", action="store_true",
+                        help="Omit the opencode permission ruleset (rely on the OS container "
+                             "sandbox). Needed for models that abort with finish=unknown when a "
+                             "tool is denied (e.g. gemini-2.5-flash via openrouter).")
 
     args = parser.parse_args()
 
@@ -200,6 +208,8 @@ def main() -> None:
     agent = OpenCodeAgent(
         model=args.analyzer_model,
         plan_size=args.analyzer_interval,
+        resume_session=not args.no_resume,
+        restrict_tools=not args.no_tool_restrictions,
     )
     log.info("Analyzer enabled (interval=%d, model=%s)", args.analyzer_interval, args.analyzer_model)
 

@@ -171,6 +171,9 @@ class GameRunner:
                         f.write(f"Action 0 | Level {level_num} | Attempt {attempt_num} | INITIAL STATE\n")
                         f.write(f"Score: {arc_score} | State: {arc_state.name}\n")
                         f.write(f"{'='*80}\n\n")
+                        avail = self._state.format_available_actions()
+                        if avail:
+                            f.write(f"{avail}\n")
                         f.write(f"[INITIAL BOARD STATE]\n{grid}\n\n")
 
             # Main game loop
@@ -188,6 +191,12 @@ class GameRunner:
                             loaded = True
                             break
                         log.warning("analyzer attempt %d/%d failed", attempt + 1, self.analyzer_retries)
+                        # Backoff before retrying: analyzer failures are often transient
+                        # provider hiccups (e.g. gemini empty/finish=unknown); let them clear.
+                        if attempt < self.analyzer_retries - 1:
+                            backoff = min(2.0 * (2 ** attempt), 20.0)
+                            log.info("backing off %.0fs before next analyzer attempt", backoff)
+                            time.sleep(backoff)
                     if not loaded:
                         raise
                     action_dict = self._next_action()

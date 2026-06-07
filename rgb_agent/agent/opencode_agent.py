@@ -193,21 +193,25 @@ class _ContainerPool:
             if val:
                 env_flags.extend(["-e", f"{key_name}={val}"])
 
+        # Rootless single-UID (no subuid range) compatibility: drop `--user 1000:1000`
+        # and the uid=/gid= tmpfs options (unmappable without a subuid range), run as
+        # root-in-userns (= host uid), and give that root a writable HOME on tmpfs.
+        # The /home/opencode tmpfs keeps nosuid but allows exec (bun needs it).
         cmd = [
             "docker", "run", "-d",
             "--name", name,
             "--read-only",
-            "--user", "1000:1000",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "--memory=4g", "--cpus=2",
             "--pids-limit=128",
             "--shm-size=8m",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000",
-            "--tmpfs", "/home/opencode:rw,noexec,nosuid,size=128m,uid=1000,gid=1000",
+            "-e", "HOME=/home/opencode",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "--tmpfs", "/home/opencode:rw,nosuid,size=128m",
             "-v", f"{os.path.realpath(sandbox)}:/workspace:rw",
             "-e", "OPENCODE_CONFIG=/workspace/opencode.json",
-            "-e", f"OPENCODE_PERMISSION={json.dumps(self._permission)}",
+            *(["-e", f"OPENCODE_PERMISSION={json.dumps(self._permission)}"] if self._permission else []),
             *env_flags,
             self._image,
             "serve", "--port", str(port), "--hostname", "0.0.0.0",
@@ -253,6 +257,11 @@ class OpenCodeAgent:
         plan_size: int = 5,
         timeout: Optional[int] = None,
         resume_session: bool = True,
+        restrict_tools: bool = True,
+        initial_prompt: Optional[str] = None,
+        resume_prompt: Optional[str] = None,
+        actions_addendum: Optional[str] = None,
+        python_addendum: Optional[str] = None,
     ) -> None:
         if not shutil.which("docker"):
             raise FileNotFoundError("'docker' CLI not found. Install Docker Desktop to use the analyzer.")
@@ -265,11 +274,29 @@ class OpenCodeAgent:
 
         self._oc_model = model if "/" in model else f"anthropic/{model}"
         self._plan_size = plan_size
+        # Prompt templates default to the ARC-AGI-3 set; callers (e.g. an
+        # AutumnBench driver) may override them to swap in a different action
+        # vocabulary. The ARC path passes nothing and is unaffected.
+        self._initial_prompt = initial_prompt or INITIAL_PROMPT
+        self._resume_prompt = resume_prompt or RESUME_PROMPT
+        self._actions_addendum = actions_addendum or ACTIONS_ADDENDUM
+        self._python_addendum = python_addendum if python_addendum is not None else PYTHON_ADDENDUM
         self._timeout = timeout
         self._resume_session = resume_session
+        # How many extra times to re-issue the opencode call when a turn ends in a
+        # provider error (finish=unknown/error or nonzero rc) with no usable output.
+        # These transient errors are common with gemini-2.5-flash via openrouter.
+        self._error_retries = 2
 
         oc_provider = self._oc_model.split("/")[0]
 
+        # NOTE: an opencode `permission` ruleset with any "deny"/"ask" entry makes some
+        # models (e.g. gemini-2.5-flash via openrouter) abort the turn with
+        # finish="unknown" and empty output the moment they call a restricted tool —
+        # they don't gracefully handle the denial the way Claude does. With
+        # restrict_tools=False we omit the opencode permission layer entirely and rely
+        # on the OS-level container sandbox (read-only rootfs, --cap-drop=ALL,
+        # no-new-privileges, ephemeral tmpfs/workspace) to constrain the analyzer.
         permission: dict = {
             "*": "deny",
             "read": "allow",
@@ -293,14 +320,15 @@ class OpenCodeAgent:
             "websearch": "deny",
             "todowrite": "deny",
             "todoread": "deny",
-        }
+        } if restrict_tools else {}
 
         config = {
             "model": self._oc_model,
             "provider": {oc_provider: {}},
-            "permission": permission,
             "agent": {"build": {"steps": 50}},
         }
+        if permission:
+            config["permission"] = permission
 
         config_dir = tempfile.mkdtemp(prefix="opencode_analyzer_")
         config_path = Path(config_dir) / "opencode.json"
@@ -315,47 +343,115 @@ class OpenCodeAgent:
 
     def _build_prompt(self, log_name: str, is_first: bool) -> str:
         if self._resume_session and not is_first:
-            prompt = RESUME_PROMPT.format(log_path=log_name)
+            prompt = self._resume_prompt.format(log_path=log_name)
         else:
-            prompt = INITIAL_PROMPT.format(log_path=log_name)
-        prompt += PYTHON_ADDENDUM.format(log_path=log_name)
-        prompt += ACTIONS_ADDENDUM.format(plan_size=self._plan_size)
+            prompt = self._initial_prompt.format(log_path=log_name)
+        prompt += self._python_addendum.format(log_path=log_name)
+        prompt += self._actions_addendum.format(plan_size=self._plan_size)
         return prompt
 
-    def _try_recover_text(self, container_name: str, sid: str, sandbox_dir: str) -> str:
-        export_path = Path(sandbox_dir) / "_export.json"
-        try:
-            subprocess.run(
-                ["docker", "exec", container_name, "sh", "-c",
-                 f"opencode export {sid} > /workspace/_export.json 2>/dev/null"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if not export_path.exists():
-                return ""
-            data = json.loads(export_path.read_text())
-            recovered = ""
-            for msg in reversed(data.get("messages", [])):
-                role = msg.get("info", {}).get("role")
-                if role == "assistant":
-                    for part in msg.get("parts", []):
-                        if part.get("type") == "text":
-                            candidate = part.get("text", "").strip()
-                            if candidate and "[ACTIONS]" in candidate:
-                                return candidate
-                            if candidate and not recovered:
-                                recovered = candidate
-                    if recovered and "[ACTIONS]" in recovered:
-                        return recovered
-            return recovered
-        except Exception as e:
-            log.debug("export recovery failed: %s", e)
-            return ""
+    def _try_recover_text(self, container_name: str, sid: str, sandbox_dir: str,
+                          max_wait: float = 30.0, poll: float = 1.0) -> str:
+        """Recover the assistant's response from the persisted session via `opencode export`.
 
-    def analyze(self, log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
-        """Analyze the game log and return the agent's response text, or None on failure."""
-        if not log_path.exists():
+        POLLS the export because opencode's `run` client often exits on a premature idle
+        event while the server is still streaming — the server keeps generating and
+        persists the full reply (incl. the trailing [ACTIONS]) shortly after, even though
+        the client already disconnected (verified: client-disconnect does not abort the
+        server). We poll until [ACTIONS] appears, or the newest assistant turn finishes
+        without it (genuine miss → let the caller's retry-nudge handle it), or timeout.
+        """
+        export_path = Path(sandbox_dir) / "_export.json"
+        deadline = time.monotonic() + max_wait
+        best = ""
+        while True:
+            data = {}
+            try:
+                subprocess.run(
+                    ["docker", "exec", container_name, "sh", "-c",
+                     f"opencode export {sid} > /workspace/_export.json 2>/dev/null"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if export_path.exists():
+                    data = json.loads(export_path.read_text())
+            except Exception as e:
+                log.debug("export recovery poll failed: %s", e)
+
+            assistants = [m for m in data.get("messages", []) if m.get("info", {}).get("role") == "assistant"]
+            actions_text = ""
+            newest_text = ""
+            newest_finish = None
+            for i, msg in enumerate(reversed(assistants)):
+                text = "".join(
+                    p.get("text", "") for p in msg.get("parts", []) if p.get("type") == "text"
+                ).strip()
+                if "[ACTIONS]" in text and not actions_text:
+                    actions_text = text
+                if i == 0:
+                    newest_text = text
+                    newest_finish = msg.get("info", {}).get("finish")
+
+            if actions_text:
+                return actions_text, (newest_finish or "stop")
+            if newest_text:
+                best = newest_text
+            # "tool-calls"/unset finish mean the turn is still going; any other finish
+            # (incl. "unknown"/"error" provider failures) means nothing more is coming.
+            terminal = newest_finish in ("stop", "length", "content-filter", "error", "unknown")
+            if terminal or time.monotonic() >= deadline:
+                return best, newest_finish
+            time.sleep(poll)
+
+    def _latest_session_id(self, container_name: str) -> Optional[str]:
+        """Read the most recent session id straight from the server's opencode.db.
+
+        Needed because opencode's `run` CLI mirrors LIVE server events to stdout and
+        exits on the idle event without reading persisted state; over the --attach SSE
+        transport those events frequently arrive after teardown, so we get zero events
+        (and thus no streamed session id) even though the turn was generated and stored.
+        Falling back to the DB lets export-based recovery run regardless.
+        """
+        try:
+            result = subprocess.run(
+                ["docker", "exec", container_name, "python3", "-c",
+                 "import sqlite3,glob;"
+                 "p=glob.glob('/home/opencode/.local/share/opencode/opencode.db')"
+                 "+glob.glob('/root/.local/share/opencode/opencode.db');"
+                 "c=sqlite3.connect(p[0]);"
+                 "print(list(c.execute('select id from session order by rowid desc limit 1'))[0][0])"],
+                capture_output=True, text=True, timeout=15,
+            )
+            sid = result.stdout.strip()
+            return sid or None
+        except Exception as e:
+            log.debug("latest-session lookup failed: %s", e)
             return None
 
+    def analyze(self, log_path: Path, action_num: int, retry_nudge: str = "") -> Optional[str]:
+        """Analyze the game log and return the agent's response text, or None on failure.
+
+        Re-issues the underlying opencode call on transient provider errors
+        (finish=unknown/error or nonzero rc with no usable output) with backoff,
+        which are common with gemini-2.5-flash via openrouter.
+        """
+        attempts = self._error_retries + 1
+        for i in range(attempts):
+            hint, provider_error = self._analyze_once(log_path, action_num, retry_nudge)
+            if hint or not provider_error or i == attempts - 1:
+                return hint
+            backoff = min(3.0 * (2 ** i), 20.0)
+            log.warning("action=%d provider error; reissuing opencode in %.0fs (%d/%d)",
+                        action_num, backoff, i + 1, self._error_retries)
+            time.sleep(backoff)
+        return None
+
+    def _analyze_once(self, log_path: Path, action_num: int,
+                      retry_nudge: str = "") -> tuple[Optional[str], bool]:
+        """One opencode call + recovery. Returns (hint, provider_error)."""
+        if not log_path.exists():
+            return None, False
+
+        provider_error = False
         analyzer_log = log_path.parent / (log_path.stem + "_analyzer.txt")
         path_key = str(log_path)
 
@@ -420,7 +516,7 @@ class OpenCodeAgent:
                         proc.kill()
                         f.write("[TIMEOUT]\n")
                         log.warning("timed out at action %d", action_num)
-                        return None
+                        return None, False
 
                     line = line.rstrip("\n")
                     if not line.strip():
@@ -441,11 +537,30 @@ class OpenCodeAgent:
                     not parser.accumulated_text.strip()
                     or "[ACTIONS]" not in parser.accumulated_text
                 )
-                if needs_recovery and parser.session_id:
-                    recovered = self._try_recover_text(container_name, parser.session_id, sandbox_dir)
-                    if recovered:
-                        parser.accumulated_text = recovered
-                        log.info("recovered %d chars via session export", len(recovered))
+                if needs_recovery:
+                    # Resolve a session id even when the stream delivered no events:
+                    # prefer the streamed id, then the resumed id we already hold, then
+                    # the latest session straight from the server DB.
+                    recovery_sid = parser.session_id or current_sid
+                    if not recovery_sid:
+                        recovery_sid = self._latest_session_id(container_name)
+                    if recovery_sid:
+                        recovered, finish = self._try_recover_text(container_name, recovery_sid, sandbox_dir)
+                        if finish in ("unknown", "error"):
+                            provider_error = True
+                        if recovered:
+                            parser.accumulated_text = recovered
+                            # The live event stream drops text/thinking events, so the
+                            # model's briefing + reasoning never reached the log. Now that
+                            # we've recovered the full assistant text from the session DB,
+                            # write it so the analyzer log shows the actual reasoning.
+                            parser._write("ASSISTANT (recovered)", recovered)
+                            # Adopt the id so session resume keeps working and the
+                            # context-overflow guard below doesn't wrongly clear it.
+                            if not parser.session_id:
+                                parser.session_id = recovery_sid
+                            log.info("recovered %d chars via session export (sid=%s, finish=%s)",
+                                     len(recovered), recovery_sid, finish)
 
                 if self._resume_session and parser.session_id is None and not is_first:
                     log.warning("context overflow — clearing session for %s", path_key)
@@ -457,20 +572,22 @@ class OpenCodeAgent:
             hint = parser.accumulated_text.strip() or None
 
             if proc.returncode != 0 or not hint:
-                log.warning("action=%d failed: rc=%d, hint_len=%d",
-                            action_num, proc.returncode, len(hint) if hint else 0)
+                if proc.returncode not in (0, None):
+                    provider_error = True
+                log.warning("action=%d failed: rc=%d, hint_len=%d, provider_error=%s",
+                            action_num, proc.returncode, len(hint) if hint else 0, provider_error)
                 if self._resume_session:
                     with self._session_lock:
                         self._session_ids.pop(path_key, None)
-                return None
+                return None, provider_error
 
             if self._resume_session and parser.session_id:
                 with self._session_lock:
                     self._session_ids[path_key] = parser.session_id
 
             log.info("action=%d OK (%d chars)", action_num, len(hint))
-            return hint
+            return hint, False
 
         except Exception as e:
             log.error("unexpected error: %s", e, exc_info=True)
-            return None
+            return None, False
