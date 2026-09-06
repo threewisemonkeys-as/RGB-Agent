@@ -51,6 +51,13 @@ try:
 except ImportError:                                     # pragma: no cover - rig absent
     LABELS = {}
 
+# The problem file the published `raw`/`icl`/`lmwm` runs were scored on. Identical to
+# `eval_curated_plan.DEFAULT_PROBLEMS` on every field the eval reads -- verified field by
+# field -- but it carries random floors measured AT THE PER-PROBLEM CAPS (86 rows vs 24),
+# which is what `_floor` needs to answer honestly and what the report prints beside each
+# row. Reading the same file as the arms this one is compared against is the point.
+PROBLEMS = REPO / "logs/2026-09-03/planning_v2_online_ds_percap_nl/problems.per-problem-floors.json"
+
 GOAL_PRESENTATION = "nl"
 SUCCESS_MODE = "any"
 CAP_MODE = "per-problem"
@@ -67,7 +74,8 @@ def load_problems(path: str | Path | None = None, *,
                   games: list[str] | None = None,
                   max_floor: float = MAX_FLOOR) -> list[dict]:
     """The 86 rows, configured exactly as the online run configured them."""
-    _meta, problems = load_eval_problems(path or DEFAULT_PROBLEMS)
+    _meta, problems = load_eval_problems(
+        path or (PROBLEMS if PROBLEMS.is_file() else DEFAULT_PROBLEMS))
     problems = select_goal_presentation(problems, GOAL_PRESENTATION, SUCCESS_MODE)
     apply_action_caps(problems, CAP_MODE)      # returns the caps; stamps the rows
     if games:
@@ -108,8 +116,12 @@ def replay_and_score(problem: dict, actions: list[str]) -> tuple[bool, int | Non
     run, and it is the same rule.
     """
     goal_test, _waived = make_goal_test(problem)
+    # The 4th argument sizes `max_episode_steps` inside the env wrapper. The online
+    # rollout and the live env both pass the problem's cap, so this does too -- deriving
+    # it from the plan length instead would build the scorer a different env than the one
+    # the arms played in, for no reason.
     branch = Branch(program_for(problem), problem["seed"], problem["_prefix"],
-                    len(actions) + 1)
+                    max(int(problem["_eval_action_cap"]), len(actions)))
     try:
         if branch.grid() != problem["start_grid"]:
             raise RuntimeError(
