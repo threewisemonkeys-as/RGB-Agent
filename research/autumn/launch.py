@@ -92,6 +92,44 @@ def run_problem(problem: dict, workspace: Path, agent, *, study_rounds: int) -> 
     return outcome
 
 
+# Everything the replay page needs and the row shape has no place for. Kept as its own
+# file per problem, so `rows.jsonl` stays exactly the online evaluator's row shape and
+# the report keeps needing no special case.
+TRACE_KEYS = ("turns", "steps", "rounds", "executed")
+
+
+def write_trace(outcome: dict, problem: dict, out_root: Path) -> Path:
+    """The turn-by-turn record: what the agent thought, ran, and did to the board.
+
+    This is written per problem rather than accumulated in memory because a 15-game run
+    is hours long and a crash at hour nine should not cost the first eight.
+    """
+    traces = Path(out_root) / "traces"
+    traces.mkdir(parents=True, exist_ok=True)
+    path = traces / (problem["task_uid"].replace(":", "_") + ".json")
+    record = {
+        "task_uid": problem["task_uid"],
+        "game": problem["game"],
+        "label": rig.LABELS.get(problem["game"], problem["game"].upper()),
+        "nl_goal": problem["nl_goal"],
+        "action_cap": problem["_eval_action_cap"],
+        "start_grid": problem["start_grid"],
+        "dims": list(problem["_dims"]),
+        "alphabet": rig.actions_for(problem["game"]),
+        "success": outcome.get("success"),
+        "reached_at": outcome.get("reached_at"),
+        "live_success": outcome.get("live_success"),
+        "failed_reason": outcome.get("failed_reason"),
+        "actions_used": outcome.get("actions_used"),
+        "study_rounds_used": outcome.get("study_rounds_used"),
+        "usage": outcome.get("usage"),
+        "wall_s": outcome.get("wall_s"),
+        **{k: outcome.get(k) for k in TRACE_KEYS},
+    }
+    path.write_text(json.dumps(record))
+    return path
+
+
 def emit_row(outcome: dict) -> dict:
     """The online evaluator's row shape, so the report needs no special case."""
     ok = bool(outcome.get("success"))
@@ -132,6 +170,10 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="replay every prefix and reference plan; zero paid calls")
     ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--transcript", default="logs/parity_proxy/reasoning.jsonl",
+                    help="the proxy's reasoning log; the replay page has no other "
+                         "source for it (codex emits none). Relative to the PRO-LONG "
+                         "checkout, which is where proxy_ctl.sh puts it.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -145,6 +187,12 @@ def main() -> None:
         return _dry_run(problems)
 
     catalog = build_catalog(out_root / "ds_catalog.json")
+    transcript = Path(args.transcript) if args.transcript else None
+    if transcript is not None and not transcript.exists():
+        # Not fatal: the arm's result does not depend on it. But a silent absence here
+        # is a run whose reasoning is gone for good, so it is said out loud once.
+        log.warning("no proxy transcript at %s yet -- reasoning will be missing from the "
+                    "replay unless the proxy was started with --transcript", transcript)
     rows_path = out_root / "rows.jsonl"
     done = set()
     if rows_path.exists():
@@ -164,10 +212,15 @@ def main() -> None:
                                     with_data=not args.no_data)
         agent = AutumnCodexAgent(workspace, catalog=catalog, base_url=args.base_url,
                                  timeout=args.timeout,
-                                 allow_unpinned=args.allow_unpinned)
+                                 allow_unpinned=args.allow_unpinned,
+                                 transcript=transcript)
         print(f"[{i}/{len(problems)}] {uid} cap={problem['_eval_action_cap']}", flush=True)
         outcome = run_problem(problem, workspace, agent,
                               study_rounds=args.study_rounds)
+        try:
+            write_trace(outcome, problem, out_root)
+        except Exception:                          # noqa: BLE001 - the row is the result;
+            log.warning("could not write the trace", exc_info=True)   # the trace is the view
         with rows_path.open("a") as handle:
             handle.write(json.dumps(emit_row(outcome)) + "\n")
         print(f"    -> {outcome.get('status')} success={outcome.get('success')} "

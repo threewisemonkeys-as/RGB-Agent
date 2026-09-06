@@ -59,16 +59,36 @@ AUTO_COMPACT_LIMIT = 900_000
 CLONE_FROM = "gpt-5.5"
 
 
-class _UsageParser(CodexEventParser):
-    """Upstream's parser plus the reasoning tokens, which it reports as a hard 0.
+# What a turn's transcript keeps. Codex\'s own log is prose written for a human tail-ing
+# a file; these are the same events kept as data, so the replay page can show a turn as
+# what the agent THOUGHT and what it DID rather than as a wall of text.
+MAX_REASONING = 20_000          # per item; deepseek\'s medium-effort blocks run ~2-6k
+MAX_COMMAND = 2_000
+MAX_OUTPUT = 8_000              # a `cat` of a 60-transition drive file is bigger than
+                                # anything worth showing, and there are hundreds of them
 
-    They are the whole point of the effort setting, so the arm has to be able to show
-    they were actually spent rather than asserting that they were.
+
+class _UsageParser(CodexEventParser):
+    """Upstream\'s parser plus two things it drops on the floor.
+
+    * **the reasoning tokens.** Upstream reports a hard 0. They are the whole point of
+      the effort setting, so the arm has to be able to show they were actually spent
+      rather than asserting that they were.
+
+    * **the turn transcript.** Upstream writes reasoning, commands and file edits to a
+      text log and keeps only a list of command STRINGS in memory -- no outputs, no exit
+      codes, no reasoning at all (`item.completed` for a `reasoning` item is handled by
+      marking the clock and discarding `text`). That is unrecoverable after the run: the
+      agent arm\'s whole claim is that it read the corpus and worked something out, and a
+      transcript that cannot show the reading or the working cannot support it. So the
+      events are kept structurally, capped, in the order they arrived.
     """
 
     def __init__(self, output):
         super().__init__(output)
         self.last_tokens_reasoning = 0
+        self.events: list[dict] = []
+        self._open: dict | None = None
 
     def handle(self, event):
         usage = (event or {}).get("usage") or {}
@@ -77,7 +97,114 @@ class _UsageParser(CodexEventParser):
                      or details.get("reasoning_tokens"))
         if reasoning is not None:
             self.last_tokens_reasoning = int(reasoning)
+        try:
+            self._capture(event or {})
+        except Exception:                          # noqa: BLE001 - never lose a turn to
+            log.debug("event capture failed", exc_info=True)   # the transcript
         return super().handle(event)
+
+    # The pairing is `item.started` -> `item.completed`; a command\'s text arrives on the
+    # first and its output on the second, so the record is opened early and filled late.
+    def _capture(self, event: dict) -> None:
+        kind = event.get("type", "")
+        item = event.get("item") or {}
+        itype = item.get("type", "")
+
+        if kind == "item.started" and itype == "command_execution":
+            self._open = {"kind": "command",
+                          "command": str(item.get("command") or "")[:MAX_COMMAND]}
+            self.events.append(self._open)
+
+        elif kind == "item.completed":
+            if itype == "reasoning":
+                text = _text_of(item)
+                if text:
+                    self.events.append({"kind": "reasoning",
+                                        "text": text[:MAX_REASONING]})
+            elif itype == "agent_message":
+                text = str(item.get("text") or "")
+                if text:
+                    self.events.append({"kind": "message", "text": text[:MAX_REASONING]})
+            elif itype == "command_execution":
+                out = str(item.get("aggregated_output") or item.get("output") or "")
+                rec = self._open if self._open is not None else {
+                    "kind": "command",
+                    "command": str(item.get("command") or "")[:MAX_COMMAND]}
+                if rec is not self._open or rec not in self.events:
+                    self.events.append(rec)
+                rec["exit_code"] = item.get("exit_code")
+                rec["output"] = out[:MAX_OUTPUT]
+                rec["truncated"] = len(out) > MAX_OUTPUT
+                self._open = None
+            elif itype == "file_change":
+                changes = item.get("changes") or []
+                self.events.append({
+                    "kind": "file_change",
+                    "changes": [{"path": str(c.get("path") or c.get("file") or ""),
+                                 "type": str(c.get("type") or c.get("kind") or "edit")}
+                                for c in changes if isinstance(c, dict)][:50],
+                    "n": len(changes),
+                })
+
+        elif kind == "error":
+            message = event.get("message") or event.get("error") or ""
+            if isinstance(message, dict):
+                message = message.get("message") or str(message)
+            self.events.append({"kind": "error", "text": str(message)[:MAX_OUTPUT]})
+
+
+def _interleave(events: list[dict], reasoning: list[list[str]]) -> list[dict]:
+    """Put each upstream call's reasoning in front of the tool call it asked for.
+
+    Codex does not tell us which model call produced which tool call, so this is an
+    alignment BY ORDER, not a hard link: within one turn the calls are strictly
+    sequential -- call k reasons, requests a tool, the tool runs, call k+1 follows -- so
+    the k-th reasoning block belongs in front of the k-th recorded action. Any surplus
+    (the final call, which answers instead of acting) is appended at the end, where it
+    belongs. Getting this wrong misplaces a block by one action; it never invents one.
+    """
+    if not reasoning:
+        return list(events)
+    actionable = [i for i, e in enumerate(events)
+                  if e.get("kind") in ("command", "file_change")]
+    out: list[dict] = []
+    used = 0
+    for i, e in enumerate(events):
+        if used < len(reasoning) and i in set(actionable[used:used + 1]):
+            for block in reasoning[used]:
+                out.append({"kind": "reasoning", "text": block[:MAX_REASONING]})
+            used += 1
+        out.append(e)
+    for block in (b for call in reasoning[used:] for b in call):
+        out.append({"kind": "reasoning", "text": block[:MAX_REASONING]})
+    return out
+
+
+def _text_of(item: dict) -> str:
+    """A reasoning item\'s text, wherever this codex build put it.
+
+    The shape has moved between releases (`text`, `summary` as a list of parts, `content`
+    as typed blocks), and a reasoning trace that silently comes back empty looks exactly
+    like a model that did not think -- which is the thing F12 exists to detect. So try
+    every shape rather than the current one.
+    """
+    for key in ("text", "reasoning", "content", "summary"):
+        val = item.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+        if isinstance(val, list):
+            parts = []
+            for entry in val:
+                if isinstance(entry, str):
+                    parts.append(entry)
+                elif isinstance(entry, dict):
+                    for k in ("text", "content", "summary"):
+                        if isinstance(entry.get(k), str):
+                            parts.append(entry[k])
+                            break
+            if parts:
+                return "\n".join(parts)
+    return ""
 
 
 def build_catalog(out_path: Path, *, codex: str = "codex") -> Path:
@@ -137,7 +264,8 @@ class AutumnCodexAgent:
                  api_key_env: str = "OPENROUTER_API_KEY", codex_home: Path | None = None,
                  model: str = MODEL, reasoning_effort: str = REASONING_EFFORT,
                  timeout: int = 1800, codex: str = "codex",
-                 allow_unpinned: bool = False) -> None:
+                 allow_unpinned: bool = False,
+                 transcript: Path | None = None) -> None:
         self.workspace = Path(workspace)
         self.catalog = Path(catalog)
         self.base_url = base_url.rstrip("/")
@@ -159,6 +287,11 @@ class AutumnCodexAgent:
         self.codex_home = Path(codex_home) if codex_home else self.workspace / ".codex"
         self.codex_home.mkdir(parents=True, exist_ok=True)
         self.agent_log = self.workspace / "agent.txt"
+        # The proxy's per-call reasoning log. A turn is bracketed by this file's size
+        # before and after the codex process runs -- calls are strictly sequential
+        # within a turn and the launcher runs one problem at a time, so the rows that
+        # appear in between are exactly this turn's.
+        self.transcript = Path(transcript) if transcript else None
 
     # ------------------------------------------------------------------ codex
     def _args(self, prompt: str, is_first: bool) -> list[str]:
@@ -198,6 +331,7 @@ class AutumnCodexAgent:
         env["CODEX_HOME"] = str(self.codex_home)
         started = time.monotonic()
         meta = {"model": self.model, "reasoning_effort": self.reasoning_effort}
+        mark = self._transcript_offset()
 
         try:
             with open(self.agent_log, "a", encoding="utf-8") as handle:
@@ -223,6 +357,8 @@ class AutumnCodexAgent:
             "output_tokens": parser.last_tokens_output or 0,
             "reasoning_tokens": parser.last_tokens_reasoning or 0,
             "commands": list(parser.commands),
+            # the turn as data: what it thought, what it ran, what came back
+            "events": _interleave(parser.events, self._reasoning_since(mark)),
             "wall_s": round(time.monotonic() - started, 1),
             "session_id": self.session_id,
         })
@@ -272,6 +408,39 @@ class AutumnCodexAgent:
         except json.JSONDecodeError as exc:
             log.warning("actions.json is malformed: %s", exc)
             return None
+
+    # ------------------------------------------------------------- the reasoning
+    def _transcript_offset(self) -> int:
+        if self.transcript is None:
+            return 0
+        try:
+            return self.transcript.stat().st_size
+        except OSError:
+            return 0
+
+    def _reasoning_since(self, offset: int) -> list[list[str]]:
+        """This turn's reasoning blocks, one list per upstream call, in call order."""
+        if self.transcript is None:
+            return []
+        try:
+            with self.transcript.open("rb") as handle:
+                handle.seek(offset)
+                raw = handle.read().decode("utf-8", "replace")
+        except OSError:
+            return []
+        out = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:      # a row still being written; the next turn
+                continue                      # will not re-read it, which is the right
+            blocks = [b for b in (row.get("reasoning") or []) if b.strip()]
+            if blocks:                        # trade for never showing half a thought
+                out.append(blocks)
+        return out
 
     def _clear(self, *names: str) -> None:
         for name in names:

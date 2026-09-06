@@ -47,6 +47,8 @@ start() {
     sleep 1
   done
   echo "started pid=$(cat "$PIDFILE") port=$PORT audit=$AUDIT"
+  # the reasoning log the replay page reads; the proxy derives it from --audit
+  echo "reasoning=$(dirname "$AUDIT")/reasoning.jsonl"
   curl -s "http://127.0.0.1:$PORT/healthz"; echo
 }
 

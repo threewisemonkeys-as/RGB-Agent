@@ -47,6 +47,15 @@ class AutumnRunner:
 
         self.queue = ActionQueue()
         self.rounds: list[dict] = []
+        # The replay record, kept beside `rounds` rather than folded into it: `rounds` is
+        # the arm's own control flow and the study-round contract is asserted against its
+        # shape, while these two exist only so the run can be watched afterwards.
+        #   turns -- one per agent call: the prompt, the reasoning, the shell it ran
+        #   steps -- one per EXECUTED action: the board it produced
+        # A step carries the index of the turn that planned it, which is what lets the
+        # page show a turn's thinking beside the board its plan actually produced.
+        self.turns: list[dict] = []
+        self.steps: list[dict] = []
         self.usage = {"calls": 0, "in": 0, "out": 0, "cache_read": 0,
                       "reasoning": 0, "cost": 0.0}
         self.studies_used = 0
@@ -77,13 +86,25 @@ class AutumnRunner:
             action = self.queue.pop()
             observation, _reward, done = self.env.step(action)
             self._recent.append(action)
+            self.steps.append({
+                "n": observation["actions_used"],
+                "action": action,
+                "grid_after": observation["grid"],
+                "reached": bool(observation["reached_goal"]),
+                "terminated": bool(observation["terminated"]),
+                "remaining": observation["remaining"],
+                "turn": len(self.turns) - 1,
+                "plan_index": self.queue.plan_index,
+                "plan_total": self.queue.plan_total,
+            })
             self._log_action(action, observation)
             if observation["reached_goal"] or observation["terminated"]:
                 self.queue.clear()
 
         outcome = self.env.outcome(failed)
         outcome.update({
-            "rounds": self.rounds, "usage": self.usage,
+            "rounds": self.rounds, "turns": self.turns, "steps": self.steps,
+            "usage": self.usage,
             "study_rounds_used": self.studies_used,
             "wall_s": round(time.time() - started, 1),
         })
@@ -95,7 +116,9 @@ class AutumnRunner:
         for attempt in range(self.agent_retries):
             payload, meta = self._call_agent(attempt)
             self._record_usage(meta)
+            turn = self._open_turn(meta, attempt)
             if payload is None:
+                turn["kind"] = "malformed"
                 self._pending_nudge = prompts.RETRY_NUDGE.format(workspace=self.workspace)
                 log.warning("no usable actions.json (attempt %d/%d)",
                             attempt + 1, self.agent_retries)
@@ -103,8 +126,10 @@ class AutumnRunner:
 
             actions, rejected = parse_actions_json(
                 payload, dims, self.alphabet, self.env.remaining)
+            turn["rejected"] = rejected
 
             if not actions and self._is_deliberate_pass(payload) and not rejected:
+                turn["kind"] = "study"
                 if self.studies_used >= self.study_rounds:
                     log.warning("study rounds exhausted; agent still will not act")
                     return "studied-out"
@@ -114,6 +139,7 @@ class AutumnRunner:
                 return "studied"
 
             if not actions:
+                turn["kind"] = "rejected"
                 self._pending_nudge = prompts.REJECTED_NUDGE.format(
                     rejections="\n".join(f"  - {r}" for r in rejected) or "  - (none parsed)",
                     workspace=self.workspace, rows=dims[0], cols=dims[1],
@@ -127,10 +153,37 @@ class AutumnRunner:
                 "n": self.env.actions_used, "remaining": self.env.remaining,
                 "plan": actions, "rejected": rejected, "kind": "plan",
             })
+            turn.update({"kind": "plan", "plan": actions})
             self.queue.load(actions)
             self._pending_nudge = ""
             return "loaded"
         return "exhausted"
+
+    def _open_turn(self, meta: dict | None, attempt: int) -> dict:
+        """One agent call, recorded whatever it produced.
+
+        A retried turn is kept, not overwritten: a malformed reply followed by a good one
+        is the arm working as designed, and a transcript that shows only the good one
+        makes the retry budget look untouched.
+        """
+        meta = meta or {}
+        turn = {
+            "i": len(self.turns),
+            "attempt": attempt,
+            "kind": "unknown",
+            "n": self.env.actions_used,
+            "remaining": self.env.remaining,
+            "prompt": meta.get("prompt") or "",
+            "events": meta.get("events") or [],
+            "plan": [],
+            "rejected": [],
+            "wall_s": meta.get("wall_s"),
+            "tokens": {k: meta.get(k) or 0 for k in
+                       ("input_tokens", "cached_tokens", "output_tokens",
+                        "reasoning_tokens")},
+        }
+        self.turns.append(turn)
+        return turn
 
     @staticmethod
     def _is_deliberate_pass(payload) -> bool:
@@ -154,7 +207,10 @@ class AutumnRunner:
         )
         if self._pending_nudge:
             prompt += f"\n\n{self._pending_nudge}"
-        return self.agent.analyze(self.log_path, prompt, is_first=first)
+        payload, meta = self.agent.analyze(self.log_path, prompt, is_first=first)
+        if isinstance(meta, dict):
+            meta.setdefault("prompt", prompt)
+        return payload, meta
 
     def _record_usage(self, meta: dict | None) -> None:
         self.usage["calls"] += 1

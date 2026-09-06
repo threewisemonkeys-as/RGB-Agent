@@ -63,6 +63,16 @@ STRIP = ("temperature", "top_p", "top_k", "seed", "max_tokens", "max_output_toke
          "frequency_penalty", "presence_penalty")
 
 GEN_ID_RE = re.compile(rb"\"(gen-[A-Za-z0-9_-]{8,})\"")
+# Codex's own `--json` event stream carries commands and messages but NOT reasoning:
+# measured on this build, `show_raw_agent_reasoning` and `model_reasoning_summary` change
+# nothing and no `reasoning` item is ever emitted. The proxy is the only place the
+# reasoning is visible, because it alone sees the raw SSE, where it arrives as
+# `response.reasoning_text.done` frames carrying the completed block. The arm's claim is
+# that the agent read a corpus and worked something out; throwing this away would leave
+# the replay page unable to show any of the working.
+REASONING_DONE = b"response.reasoning_text.done"
+MAX_REASONING_PER_CALL = 200_000
+
 HEAD_BYTES = 8192          # the id is in the first SSE frame (`response.created`)
 TAIL_BYTES = 65536         # ...and the usage block sits at the end of the last one
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -126,13 +136,20 @@ def _served_by_pinned(provider_name: str, tags: dict[str, str], pin=PIN) -> bool
 class Parity:
     def __init__(self, *, pin=PIN, strip=STRIP, audit_path: Path | None = None,
                  dump_dir: Path | None = None, upstream: str = UPSTREAM,
-                 model: str = MODEL) -> None:
+                 model: str = MODEL, transcript: Path | None = None) -> None:
         self.pin, self.strip, self.upstream = tuple(pin), tuple(strip), upstream.rstrip("/")
         self.model = model
         self.audit_path = Path(audit_path) if audit_path else None
         self.dump_dir = Path(dump_dir) if dump_dir else None
         if self.dump_dir:
             self.dump_dir.mkdir(parents=True, exist_ok=True)
+        # One row per upstream call, in call order. The agent brackets a codex turn by
+        # this file's byte offsets, which is what lets a turn's reasoning be recovered
+        # even though nothing codex emits carries it.
+        self.transcript = Path(transcript) if transcript else None
+        if self.transcript:
+            self.transcript.parent.mkdir(parents=True, exist_ok=True)
+        self.seq = 0
         self.tags: dict[str, str] = {}
         self.calls = 0
         self.audited = 0
@@ -226,6 +243,22 @@ class Parity:
         with self.audit_path.open("a") as handle:
             handle.write(json.dumps({"t": round(time.time(), 3), **row}) + "\n")
 
+    def _write_transcript(self, started: float, reasoning: list[str],
+                          status: int) -> None:
+        """One line per call, appended and flushed, so a reader tailing the file by
+        offset sees whole rows and never a half-written one."""
+        if self.transcript is None:
+            return
+        self.seq += 1
+        row = {"seq": self.seq, "t0": round(started, 3), "t1": round(time.time(), 3),
+               "status": status, "reasoning": reasoning}
+        try:
+            with self.transcript.open("a") as handle:
+                handle.write(json.dumps(row) + "\n")
+                handle.flush()
+        except OSError:                                # the transcript is a view, never
+            log.warning("could not append to the transcript", exc_info=True)  # the run
+
 
 def build_app(state: Parity) -> FastAPI:
     @asynccontextmanager
@@ -297,6 +330,29 @@ def build_app(state: Parity) -> FastAPI:
         state.calls += 1
         head, tail = bytearray(), bytearray()
         dump = state.dump_dir / f"{time.time():.3f}.resp.txt" if state.dump_dir else None
+        # SSE frames are line-delimited but chunks are not, so a frame straddles chunks;
+        # `pending` carries the unterminated tail into the next one.
+        pending = bytearray()
+        reasoning: list[str] = []
+        started = time.time()
+
+        def scan(buf: bytearray) -> None:
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[:nl])
+                del buf[:nl + 1]
+                if REASONING_DONE not in line or not line.startswith(b"data: "):
+                    continue
+                try:
+                    frame = json.loads(line[6:])
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                text = frame.get("text")
+                if frame.get("type") == "response.reasoning_text.done" and text:
+                    if sum(len(x) for x in reasoning) < MAX_REASONING_PER_CALL:
+                        reasoning.append(str(text))
 
         async def stream():                                      # noqa: ANN202
             try:
@@ -306,11 +362,17 @@ def build_app(state: Parity) -> FastAPI:
                     tail.extend(chunk)
                     if len(tail) > TAIL_BYTES:
                         del tail[:-TAIL_BYTES]
+                    if state.transcript is not None:
+                        pending.extend(chunk)
+                        scan(pending)
+                        if len(pending) > 1_000_000:   # not a frame; do not grow forever
+                            del pending[:-4096]
                     if dump:
                         with dump.open("ab") as handle:
                             handle.write(chunk)
                     yield chunk
             finally:
+                state._write_transcript(started, reasoning, upstream.status_code)
                 await stack.aclose()
                 match = GEN_ID_RE.search(bytes(head))
                 note.update({"status": upstream.status_code,
@@ -422,6 +484,11 @@ def main() -> None:
     ap.add_argument("--verify", action="store_true", help="probe a running proxy and exit")
     ap.add_argument("--report", action="store_true", help="summarise --audit and exit")
     ap.add_argument("--model", default="deepseek/deepseek-v4-flash")
+    ap.add_argument("--transcript", default="",
+                    help="reasoning.jsonl: one row per upstream call, carrying the "
+                         "reasoning codex does not emit. Defaults to sitting beside "
+                         "--audit, because a run that records the pin and not the "
+                         "working is only half a record.")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -438,7 +505,10 @@ def main() -> None:
     state = Parity(pin=tuple(x.strip() for x in args.pin.split(",") if x.strip()),
                    audit_path=Path(args.audit) if args.audit else None,
                    dump_dir=Path(args.dump_dir) if args.dump_dir else None,
-                   model=args.model)
+                   model=args.model,
+                   transcript=(Path(args.transcript) if args.transcript
+                               else (Path(args.audit).with_name("reasoning.jsonl")
+                                     if args.audit else None)))
     uvicorn.run(build_app(state), host=args.host, port=args.port, log_level="warning")
 
 
