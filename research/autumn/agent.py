@@ -15,7 +15,19 @@ you meant to run:
   real window of 1,000,000, so a long session auto-compacts and discards its own
   analysis a quarter of the way in. The fix is `model_catalog_json`, a file path with a
   ~35-field schema; `build_catalog` clones a real entry rather than hand-rolling one,
-  which also preserves codex's own 17k-character `base_instructions`.
+  which also preserves codex's own `base_instructions`.
+
+* **which entry gets cloned.** The clone carries a tool surface as well as a context
+  window, and `tool_mode="code_mode_only"` -- what every gpt-5.6 entry sets -- offers the
+  model exactly one way to act: a CUSTOM tool whose argument is raw JavaScript, run in a
+  V8 isolate. DeepSeek calls it with JSON (`{"code": "..."}`) instead of freeform text,
+  codex cannot parse the call, and the tool silently does nothing: no output item, no
+  error, the turn just ends having accomplished nothing. Measured on a one-line "write
+  this file" task, cloning `gpt-5.6-sol` succeeded 1 time in 5 and ran 0 shell commands
+  at 73k-107k input tokens a call; cloning `gpt-5.5`, whose `tool_mode` is unset and
+  which therefore offers ordinary `exec_command` function calls, succeeded 3 of 3 at 27k.
+  The 46k-token difference is the code-mode preamble plus a sub-agent namespace this arm
+  has no use for -- charged on every call, against the context the corpus needs.
 
 * **the provider.** Codex cannot send OpenRouter's `provider` body field, and nothing it
   CAN send substitutes: a model-slug suffix, a `?provider=` query param and an
@@ -44,7 +56,7 @@ REASONING_EFFORT = "medium"
 CONTEXT_WINDOW = 1_000_000          # min across parasail/novita/alibaba fp8, not the
 MAX_OUTPUT_TOKENS = 393_216         # 1,048,576 headline: the pin's smallest host wins
 AUTO_COMPACT_LIMIT = 900_000
-CLONE_FROM = "gpt-5.6-sol"
+CLONE_FROM = "gpt-5.5"
 
 
 class _UsageParser(CodexEventParser):
@@ -80,7 +92,25 @@ def build_catalog(out_path: Path, *, codex: str = "codex") -> Path:
     raw = subprocess.run([codex, "debug", "models"], capture_output=True, text=True,
                          timeout=120, check=True).stdout
     models = json.loads(raw)["models"]
-    source = next((m for m in models if m["slug"] == CLONE_FROM), None) or models[0]
+    source = next((m for m in models if m["slug"] == CLONE_FROM), None)
+    if source is None:
+        # Fall back on the PROPERTY, never on models[0]: the thing that matters about the
+        # clone is that it is not code-mode, and a silent fallback to a code-mode entry
+        # produces an agent that reasons, calls its one tool, is ignored, and stops.
+        source = next((m for m in models if not m.get("tool_mode")), None)
+        if source is None:
+            raise RuntimeError(
+                f"{CLONE_FROM!r} is gone from codex's catalog and every remaining entry "
+                "is tool_mode=code_mode_only, which this model cannot drive. Re-measure "
+                "before running the arm.")
+        log.warning("%s is gone from codex's catalog; cloning %s instead",
+                    CLONE_FROM, source["slug"])
+    if source.get("tool_mode") == "code_mode_only":
+        raise RuntimeError(
+            f"{source['slug']} is tool_mode=code_mode_only: its only tool takes freeform "
+            "JavaScript, which this model emits as JSON, so every tool call is dropped "
+            "without an error. Measured 1/5 success against 3/3 for a non-code-mode "
+            "clone.")
 
     entry = json.loads(json.dumps(source))
     entry.update({
