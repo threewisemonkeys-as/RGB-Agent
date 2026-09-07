@@ -31,7 +31,8 @@ import time
 from pathlib import Path
 
 from research.autumn import prompts, rig
-from research.autumn.agent import AutumnCodexAgent, build_catalog
+from research.autumn.agent import (
+    AutumnCodexAgent, CredentialsExhausted, build_catalog)
 from research.autumn.env import AutumnPlanningEnv, StartMismatch
 from research.autumn.runner import AutumnRunner
 
@@ -215,14 +216,26 @@ def main() -> None:
                                  allow_unpinned=args.allow_unpinned,
                                  transcript=transcript)
         print(f"[{i}/{len(problems)}] {uid} cap={problem['_eval_action_cap']}", flush=True)
-        outcome = run_problem(problem, workspace, agent,
-                              study_rounds=args.study_rounds)
+        try:
+            outcome = run_problem(problem, workspace, agent,
+                                  study_rounds=args.study_rounds)
+        except CredentialsExhausted as exc:
+            # No row is written. A row here would say `budget-exhausted` against a session
+            # that never reached the model, and `rows.jsonl` is also the resume ledger --
+            # so it would be skipped on the way back and stand as a real miss forever.
+            print(f"\nSTOPPING: the API key is finished -- {exc}\n"
+                  f"  {len(done)} problem(s) recorded and clean; {uid} was in flight and "
+                  f"is NOT recorded.\n"
+                  f"  Fix the key, then re-run the same command: it resumes from "
+                  f"{rows_path} and replays this problem from the start.", flush=True)
+            sys.exit(2)
         try:
             write_trace(outcome, problem, out_root)
         except Exception:                          # noqa: BLE001 - the row is the result;
             log.warning("could not write the trace", exc_info=True)   # the trace is the view
         with rows_path.open("a") as handle:
             handle.write(json.dumps(emit_row(outcome)) + "\n")
+        done.add(uid)
         print(f"    -> {outcome.get('status')} success={outcome.get('success')} "
               f"actions={outcome.get('actions_used')} "
               f"calls={(outcome.get('usage') or {}).get('calls')}", flush=True)

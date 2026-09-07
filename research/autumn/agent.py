@@ -67,6 +67,26 @@ MAX_COMMAND = 2_000
 MAX_OUTPUT = 8_000              # a `cat` of a 60-transition drive file is bigger than
                                 # anything worth showing, and there are hundreds of them
 
+# Errors that mean the ACCOUNT is finished, not that this turn went badly. Codex retries a
+# 403 five times and then reports an ordinary failed turn, so without this the runner
+# treats a dead key exactly like a model that would not answer: it retries, records
+# `budget-exhausted` against a session that never reached the model, moves to the next
+# problem and does it again. Measured: the key hit its spend limit 12.9h into the 86 and
+# the run recorded one such row before it was stopped by hand -- and because `launch.py`
+# skips any task_uid already in `rows.jsonl`, that row would have survived the resume and
+# gone into the paper as a real miss.
+FATAL_PATTERNS = (
+    "key limit exceeded", "insufficient_quota", "insufficient credits",
+    "quota exceeded", "payment required", "billing",
+    "invalid api key", "no auth credentials", "unauthorized",
+    "403 forbidden", "401 unauthorized",
+)
+
+
+class CredentialsExhausted(RuntimeError):
+    """The key is out of money or invalid. Every remaining problem would fail the same
+    way, so the run stops instead of writing 55 rows nobody can use."""
+
 
 class _UsageParser(CodexEventParser):
     """Upstream\'s parser plus two things it drops on the floor.
@@ -89,6 +109,7 @@ class _UsageParser(CodexEventParser):
         self.last_tokens_reasoning = 0
         self.events: list[dict] = []
         self._open: dict | None = None
+        self.fatal_error: str | None = None
 
     def handle(self, event):
         usage = (event or {}).get("usage") or {}
@@ -146,11 +167,15 @@ class _UsageParser(CodexEventParser):
                     "n": len(changes),
                 })
 
-        elif kind == "error":
+        elif kind in ("error", "turn.failed"):
             message = event.get("message") or event.get("error") or ""
             if isinstance(message, dict):
                 message = message.get("message") or str(message)
-            self.events.append({"kind": "error", "text": str(message)[:MAX_OUTPUT]})
+            message = str(message)
+            self.events.append({"kind": "error", "text": message[:MAX_OUTPUT]})
+            low = message.lower()
+            if any(pat in low for pat in FATAL_PATTERNS):
+                self.fatal_error = message[:500]
 
 
 def _interleave(events: list[dict], reasoning: list[list[str]]) -> list[dict]:
@@ -342,6 +367,11 @@ class AutumnCodexAgent:
             log.error("codex call failed: %s", exc, exc_info=True)
             self.session_id = None
             return None, meta
+
+        if parser.fatal_error:
+            # Not this turn's problem, and not recoverable by retrying: stop the run
+            # before it manufactures failures for every problem that is left.
+            raise CredentialsExhausted(parser.fatal_error)
 
         self.calls += 1
         if parser.session_id:
