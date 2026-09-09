@@ -18,6 +18,18 @@ Two additions the ARC prompt has no need for:
 """
 from __future__ import annotations
 
+WORLD_MODEL_SECTION = """
+`{workspace}/nlwm/` holds a world model another method learned from the SAME transitions
+in `{workspace}/drives/`:
+
+    beliefs.txt     prose facts about how this world behaves
+    perception.py   a summariser: `perceive(["<board JSON>"]) -> str`
+    README.md       the calling contract, and how to run it over the drives
+
+Both were fit to that data, not read off this world's source. They may be incomplete or
+wrong, and `drives/` is the evidence that can settle it.
+"""
+
 SYSTEM_PROMPT = """\
 You are a coding agent playing a grid world by writing action plans.
 
@@ -37,7 +49,7 @@ JSON per file (`state`, `action`, `next_state`, and `context`, the frames that p
 the state), plus `index.csv`. It is the only evidence you have about how this world
 behaves. Grep it, load it in Python, diff states against next_states -- do not read it
 into context, it is megabytes.
-
+{world_model_section}
 **Tools**: Read, Write, Edit, Bash, Grep, Glob.
 
 **Workspace**: `{workspace}/` persists across calls. `actions.json` is cleared each
@@ -139,7 +151,7 @@ def format_actions_block(alphabet, dims) -> str:
 
 def build_system_prompt(*, goal: str, action_cap: int, alphabet, dims,
                         workspace: str = "/workspace", log_window=None,
-                        study_rounds: int = 5) -> str:
+                        study_rounds: int = 5, world_model: bool = False) -> str:
     if log_window is None:
         window = "It contains the full history of this problem."
     elif log_window > 0:
@@ -152,4 +164,6 @@ def build_system_prompt(*, goal: str, action_cap: int, alphabet, dims,
         log_window_desc=window, rows=rows, cols=cols,
         actions_section=format_actions_block(alphabet, dims),
         study_rounds=study_rounds,
+        world_model_section=(WORLD_MODEL_SECTION.format(workspace=workspace)
+                             if world_model else ""),
     )
