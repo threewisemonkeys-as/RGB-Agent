@@ -62,6 +62,13 @@ PIN = ("parasail/fp8", "novita/fp8", "alibaba/fp8")
 STRIP = ("temperature", "top_p", "top_k", "seed", "max_tokens", "max_output_tokens",
          "frequency_penalty", "presence_penalty")
 
+# The /generation record is not queryable the instant the stream closes -- measured, a
+# 15s budget gave up at 404 on a call that resolved at ~17s. The audit runs detached, so
+# patience is free. It is a knob rather than a literal because it is real wall-clock: a
+# test driving the proxy against a stub upstream must be able to set it to (0.0,) instead
+# of sleeping out 123s of production backoff.
+AUDIT_BACKOFF = (2.0, 3.0, 5.0, 8.0, 15.0, 30.0, 60.0)
+
 GEN_ID_RE = re.compile(rb"\"(gen-[A-Za-z0-9_-]{8,})\"")
 # Codex's own `--json` event stream carries commands and messages but NOT reasoning:
 # measured on this build, `show_raw_agent_reasoning` and `model_reasoning_summary` change
@@ -136,10 +143,12 @@ def _served_by_pinned(provider_name: str, tags: dict[str, str], pin=PIN) -> bool
 class Parity:
     def __init__(self, *, pin=PIN, strip=STRIP, audit_path: Path | None = None,
                  dump_dir: Path | None = None, upstream: str = UPSTREAM,
-                 model: str = MODEL, transcript: Path | None = None) -> None:
+                 model: str = MODEL, transcript: Path | None = None,
+                 audit_backoff=AUDIT_BACKOFF) -> None:
         self.pin, self.strip, self.upstream = tuple(pin), tuple(strip), upstream.rstrip("/")
         self.model = model
         self.audit_path = Path(audit_path) if audit_path else None
+        self.audit_backoff = tuple(audit_backoff)
         self.dump_dir = Path(dump_dir) if dump_dir else None
         if self.dump_dir:
             self.dump_dir.mkdir(parents=True, exist_ok=True)
@@ -201,10 +210,9 @@ class Parity:
         key = os.environ.get("OPENROUTER_API_KEY", "")
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         record = None
-        # Measured: the record is not queryable the instant the stream closes -- a 15s
-        # budget gave up at 404 on a call that resolved at ~17s. This runs detached, so
-        # patience is free and a null provider is a hole in the arm's evidence.
-        for delay in (2.0, 3.0, 5.0, 8.0, 15.0, 30.0, 60.0):
+        # A null provider is a hole in the arm's evidence, so poll out the full ladder
+        # rather than accepting the first 404 as an answer. See AUDIT_BACKOFF.
+        for delay in self.audit_backoff:
             await asyncio.sleep(delay)
             try:
                 r = await self.client.get(f"{self.upstream}/generation",
